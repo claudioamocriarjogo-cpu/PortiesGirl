@@ -1,0 +1,118 @@
+name: Decompile Unity game (AssetRipper)
+
+# Coloque em: .github/workflows/decompile.yml
+#
+# Como usar:
+# 1. Crie uma Release com a tag "decompiler" e anexe o .zip do jogo nela
+#    (o limite de arquivo no git é 100MB, mas em Release vai até 2GB).
+# 2. Publique a release (ou rode manualmente em Actions > Run workflow).
+# 3. Ao final, baixe o resultado em Actions > run > Artifacts.
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag onde o jogo está"
+        default: "decompiler"
+        required: true
+
+env:
+  GAME_TAG: ${{ github.event.inputs.tag || 'decompiler' }}
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    # Só roda se a release for da tag "decompiler" (ou se for manual)
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name == 'decompiler'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Baixar o jogo da tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p input
+          if ! gh release download "$GAME_TAG" --repo "$GITHUB_REPOSITORY" --dir input --pattern '*.zip' --pattern '*.7z' --pattern '*.rar'; then
+            echo "::error::Nenhum jogo encontrado na tag '$GAME_TAG'. Anexe o .zip na release."
+            exit 1
+          fi
+          ls -lh input
+
+      - name: Extrair o jogo
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+          mkdir -p game
+          for f in input/*; do 7z x -y -ogame "$f" >/dev/null; done
+          # confere se é um jogo Unity
+          if ! find game -maxdepth 3 -type d -name '*_Data' | grep -q .; then
+            echo "::error::Não achei a pasta *_Data. Não parece ser um jogo Unity."
+            exit 1
+          fi
+          find game -maxdepth 2 | head -20
+
+      - name: Baixar o AssetRipper (última versão, Linux)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ripper
+          gh release download --repo AssetRipper/AssetRipper --dir ripper --pattern '*linux_x64*.zip'
+          unzip -q ripper/*.zip -d ripper
+          RIPPER_BIN=$(find ripper -type f -name 'AssetRipper.GUI.Free' | head -1)
+          chmod +x "$RIPPER_BIN"
+          echo "RIPPER_BIN=$RIPPER_BIN" >> "$GITHUB_ENV"
+
+      - name: Rodar AssetRipper (headless) e exportar
+        run: |
+          GAME_DIR=$(find game -maxdepth 3 -type d -name '*_Data' | head -1 | xargs -d '\n' dirname)
+          GAME_DIR=$(realpath "$GAME_DIR")
+          OUT_DIR=$(realpath -m output)
+          mkdir -p "$OUT_DIR"
+          echo "Jogo: $GAME_DIR"
+
+          "$RIPPER_BIN" --headless --port 8888 > ripper.log 2>&1 &
+          RIPPER_PID=$!
+
+          # espera subir
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null http://127.0.0.1:8888/ && break
+            sleep 2
+          done
+
+          echo "Carregando jogo..."
+          curl -sS -f -X POST http://127.0.0.1:8888/LoadFolder \
+            --data-urlencode "path=$GAME_DIR"
+
+          echo "Exportando projeto Unity..."
+          curl -sS -f --max-time 5400 -X POST http://127.0.0.1:8888/Export/UnityProject \
+            --data-urlencode "path=$OUT_DIR"
+
+          kill $RIPPER_PID || true
+          echo "Resultado:"
+          du -sh "$OUT_DIR"
+          ls "$OUT_DIR"
+
+      - name: Compactar resultado
+        run: |
+          cd output
+          zip -qr ../decompiled.zip .
+          ls -lh ../decompiled.zip
+
+      - name: Subir para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: jogo-decompilado
+          path: decompiled.zip
+          retention-days: 7
+          compression-level: 0
+
+      - name: Logs do AssetRipper (em caso de erro)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripper-log
+          path: ripper.log
