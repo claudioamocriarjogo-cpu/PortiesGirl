@@ -1,0 +1,107 @@
+name: decompile
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  GAME_TAG: decompiler
+
+jobs:
+  decompile:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name == 'decompiler'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Baixar o jogo da tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input
+          if ! gh release download "$GAME_TAG" --repo "$GITHUB_REPOSITORY" --dir input --pattern '*.zip' --pattern '*.7z' --pattern '*.rar'; then
+            echo "::error::Nenhum jogo encontrado na tag '$GAME_TAG'. Anexe o .zip na release."
+            exit 1
+          fi
+          ls -lh input
+
+      - name: Extrair o jogo
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+          mkdir -p game
+          for f in input/*; do 7z x -y -ogame "$f" >/dev/null; done
+          # confere se é um jogo Unity
+          if ! find game -maxdepth 3 -type d -name '*_Data' | grep -q .; then
+            echo "::error::Não achei a pasta *_Data. Não parece ser um jogo Unity."
+            exit 1
+          fi
+          find game -maxdepth 2 | head -20
+
+      - name: Baixar o AssetRipper (última versão, Linux)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ripper
+          # Desde a 2.0.0 o AssetRipper usa .tar.xz no Linux (antes era .zip)
+          gh release download --repo AssetRipper/AssetRipper --dir ripper --pattern '*linux_x64*'
+          ls -lh ripper
+          for f in ripper/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ripper ;;
+              *.tar.*|*.tgz) tar -xf "$f" -C ripper ;;
+            esac
+          done
+          RIPPER_BIN=$(find ripper -type f \( -name 'AssetRipper.GUI.Free' -o -name 'AssetRipper' \) | head -1)
+          test -n "$RIPPER_BIN" || { echo "::error::Executável do AssetRipper não encontrado"; ls -R ripper; exit 1; }
+          chmod +x "$RIPPER_BIN"
+          echo "RIPPER_BIN=$RIPPER_BIN" >> "$GITHUB_ENV"
+
+      - name: Rodar o AssetRipper e exportar o projeto Unity
+        run: |
+          DATA_DIR=$(find game -maxdepth 3 -type d -name '*_Data' -print -quit)
+          GAME_DIR=$(realpath "$(dirname "$DATA_DIR")")
+          OUT_DIR="$(pwd)/out"
+          mkdir -p "$OUT_DIR"
+          echo "Jogo: $GAME_DIR"
+
+          "$RIPPER_BIN" --headless --port 5000 > ripper.log 2>&1 &
+          RIPPER_PID=$!
+
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:5000/; then break; fi
+            sleep 2
+          done
+
+          curl -sS --max-time 1800 -o /dev/null -w "LoadFolder: HTTP %{http_code}\n" \
+            -X POST http://127.0.0.1:5000/LoadFolder --data-urlencode "path=$GAME_DIR"
+          curl -sS --max-time 3600 -o /dev/null -w "Export: HTTP %{http_code}\n" \
+            -X POST http://127.0.0.1:5000/Export/UnityProject --data-urlencode "path=$OUT_DIR"
+
+          kill "$RIPPER_PID" 2>/dev/null || true
+          test -n "$(ls -A "$OUT_DIR")" || { echo "::error::A exportação ficou vazia"; exit 1; }
+          du -sh "$OUT_DIR"
+
+      - name: Compactar o projeto
+        run: |
+          cd out
+          zip -qr ../ProjetoUnity.zip .
+          ls -lh ../ProjetoUnity.zip
+
+      - name: Enviar o projeto
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjetoUnity
+          path: ProjetoUnity.zip
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Logs do AssetRipper (em caso de erro)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripper-log
+          path: ripper.log
+          if-no-files-found: warn
