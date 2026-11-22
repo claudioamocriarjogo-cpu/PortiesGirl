@@ -1,0 +1,1086 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      RELEASE_TAG: "jogo"
+      ZIP_NAME: Miliko_Broken_Heart.zip
+      APP_ID: com.honokodev.milikosport
+    steps:
+      - name: Baixar e arrumar o projeto
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ZIP_NAME" --dir "$RUNNER_TEMP"
+          else
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "$ZIP_NAME" --dir "$RUNNER_TEMP"
+          fi
+          unzip -q "$RUNNER_TEMP/$ZIP_NAME" -d "$RUNNER_TEMP/extraido"
+          rm "$RUNNER_TEMP/$ZIP_NAME"
+          VERSION_FILE=$(find "$RUNNER_TEMP/extraido" -path '*ProjectSettings/ProjectVersion.txt' | head -n 1)
+          test -n "$VERSION_FILE" || { echo "ProjectVersion.txt nao encontrado"; exit 1; }
+          PROJ=$(dirname "$(dirname "$VERSION_FILE")")
+          mv "$PROJ" "$GITHUB_WORKSPACE/project"
+          rm -rf "$GITHUB_WORKSPACE/project/Library" "$GITHUB_WORKSPACE/project/obj" "$GITHUB_WORKSPACE/project/.vs"
+          cat "$GITHUB_WORKSPACE/project/ProjectSettings/ProjectVersion.txt"
+          ls "$GITHUB_WORKSPACE/project"
+          df -h /
+
+      - name: Escolher a versao da Unity (aceita projeto de qualquer versao)
+        run: |
+          PV="project/ProjectSettings/ProjectVersion.txt"
+          ORIG=$(grep -m1 -E '^m_EditorVersion:' "$PV" | sed -E 's/^m_EditorVersion:[[:space:]]*//' | tr -d '\r[:space:]')
+          MAJOR=$(echo "$ORIG" | sed -E 's/^([0-9]+)\..*/\1/')
+          case "$MAJOR" in
+            ''|*[!0-9]*) UV="2019.4"; MOTIVO="versao do projeto nao lida" ;;
+            2017) UV="2017.4"; MOTIVO="mesma serie" ;;
+            2018) UV="2018.4"; MOTIVO="mesma serie" ;;
+            2019) UV="2019.4"; MOTIVO="mesma serie" ;;
+            2020) UV="2020.3"; MOTIVO="mesma serie" ;;
+            *)
+              if [ "$MAJOR" -lt 2017 ]; then UV="2017.4"; MOTIVO="projeto antigo (4.x/5.x): a Unity atualiza o projeto"
+              else UV="2020.3"; MOTIVO="projeto novo (2021+/6000): usa a mais nova que funciona no CI"; fi ;;
+          esac
+          echo "Versao do projeto: ${ORIG:-desconhecida}"
+          echo "Serie da Unity que sera usada: $UV ($MOTIVO)"
+
+          # Descobre a ultima versao da serie e o changeset (o ProjectVersion exportado nao tem)
+          API="https://services.api.unity.com/unity/editor/release/v1/releases"
+          pegar() { curl -fsS --retry 3 --max-time 60 "$1" | grep -oE 'unityhub://[0-9a-z.]+/[0-9a-f]{12}' | head -n 1; }
+          LINK=$(pegar "$API?version=$UV&limit=1&order=RELEASE_DATE_DESC&platform=LINUX&architecture=X86_64" || true)
+          [ -n "$LINK" ] || LINK=$(pegar "$API?version=$UV&limit=1&order=RELEASE_DATE_DESC&platform=LINUX" || true)
+          [ -n "$LINK" ] || LINK=$(pegar "$API?version=$UV&limit=1&order=RELEASE_DATE_DESC" || true)
+          FULL=$(echo "$LINK" | sed -E 's#^unityhub://([^/]+)/.*#\1#')
+          CS=$(echo "$LINK" | sed -E 's#^.*/([0-9a-f]{12})$#\1#')
+          if [ -z "$LINK" ]; then
+            case "$UV" in
+              2020.3) FULL="2020.3.48f1"; CS="b805b124c6b7" ;;
+              2019.4) FULL="2019.4.40f1"; CS="ffc62b691db5" ;;
+              *) echo "Nao consegui descobrir a versao exata da Unity $UV pela API da Unity"; exit 1 ;;
+            esac
+            echo "API da Unity indisponivel, usando versao conhecida"
+          fi
+          echo "Unity que sera instalada: $FULL ($CS)"
+          echo "UNITY_VERSION=$FULL ($CS)" >> "$GITHUB_ENV"
+
+          # A action le o ProjectVersion.txt e exige a linha com o changeset.
+          # Guarda o original e usa um temporario so durante a instalacao.
+          cp "$PV" "$RUNNER_TEMP/ProjectVersion.original"
+          printf 'm_EditorVersion: %s\nm_EditorVersionWithRevision: %s (%s)\n' "$FULL" "$FULL" "$CS" > "$PV"
+
+      - name: Criar script de build do Editor
+        run: |
+          mkdir -p project/Assets/Editor
+          cat > project/Assets/Editor/CIBuild.cs <<'EOF'
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEngine;
+
+          public static class CIBuild
+          {
+              public static void Build()
+              {
+                  string appId = System.Environment.GetEnvironmentVariable("APP_ID");
+                  string workspace = System.Environment.GetEnvironmentVariable("GITHUB_WORKSPACE");
+
+                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, appId);
+
+                  // O cursor padrao do projeto tem textura invalida e derruba a Unity (SIGSEGV no Xcursor) sem tela.
+                  PlayerSettings.defaultCursor = null;
+                  PlayerSettings.cursorHotspot = Vector2.zero;
+                  PlayerSettings.bundleVersion = "0.1";
+                  PlayerSettings.Android.bundleVersionCode = 1;
+                  PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel22;
+                  #if UNITY_2018_1_OR_NEWER
+                  PlayerSettings.Android.targetSdkVersion = AndroidSdkVersions.AndroidApiLevelAuto;
+                  #endif
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                  #if UNITY_2018_1_OR_NEWER
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARMv7 | AndroidArchitecture.ARM64;
+                  #else
+                  PlayerSettings.Android.targetDevice = AndroidTargetDevice.FAT;
+                  #endif
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
+                  PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new UnityEngine.Rendering.GraphicsDeviceType[] { UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 });
+                  #if UNITY_2018_2_OR_NEWER
+                  PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.Android, ManagedStrippingLevel.Disabled);
+                  #else
+                  PlayerSettings.strippingLevel = StrippingLevel.Disabled;
+                  #endif
+                  #if UNITY_2019_3_OR_NEWER
+                  PlayerSettings.Android.useCustomKeystore = false;
+                  PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, Il2CppCompilerConfiguration.Release);
+                  #endif
+                  PlayerSettings.SetMobileMTRendering(BuildTargetGroup.Android, true);
+                  PlayerSettings.gpuSkinning = true;
+                  #if UNITY_2019_3_OR_NEWER
+                  EditorUserBuildSettings.buildAppBundle = false;
+                  #endif
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                  PlayerSettings.allowedAutorotateToPortrait = false;
+                  PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                  PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                  PlayerSettings.allowedAutorotateToLandscapeRight = true;
+
+                  // Qualidade Low (nivel 0) como padrao no Android
+                  try
+                  {
+                      Object[] qa = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/QualitySettings.asset");
+                      if (qa != null && qa.Length > 0)
+                      {
+                          SerializedObject qso = new SerializedObject(qa[0]);
+                          SerializedProperty pq = qso.FindProperty("m_PerPlatformDefaultQuality");
+                          if (pq != null)
+                          {
+                              for (int qi = 0; qi < pq.arraySize; qi++)
+                              {
+                                  SerializedProperty sec = pq.GetArrayElementAtIndex(qi).FindPropertyRelative("second");
+                                  if (sec != null) sec.intValue = 0;
+                              }
+                              qso.ApplyModifiedPropertiesWithoutUndo();
+                          }
+                      }
+                  }
+                  catch (System.Exception e) { Debug.LogWarning("Qualidade padrao nao ajustada: " + e.Message); }
+
+                  string[] scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
+                  if (scenes.Length == 0)
+                  {
+                      Debug.LogWarning("Nenhuma cena ativa no Build Settings. Usando todas as cenas de Assets.");
+                      scenes = AssetDatabase.FindAssets("t:Scene").Select(g => AssetDatabase.GUIDToAssetPath(g)).Where(p => p.StartsWith("Assets/")).ToArray();
+                  }
+                  Debug.Log("Cenas no build: " + scenes.Length);
+
+                  string outDir = Path.Combine(workspace, "build");
+                  Directory.CreateDirectory(outDir);
+
+                  var options = new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = Path.Combine(outDir, "Yamane.apk"),
+                      target = BuildTarget.Android,
+                      options = BuildOptions.CompressWithLz4
+                  };
+
+                  #if UNITY_2018_1_OR_NEWER
+                  var report = BuildPipeline.BuildPlayer(options);
+                  if (report.summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
+                  {
+                      EditorApplication.Exit(1);
+                  }
+                  #else
+                  string err = BuildPipeline.BuildPlayer(options);
+                  if (!string.IsNullOrEmpty(err))
+                  {
+                      Debug.LogError(err);
+                      EditorApplication.Exit(1);
+                  }
+                  #endif
+              }
+          }
+          EOF
+
+      - name: Criar camada de toque (joystick e botoes)
+        run: |
+          cat > project/Assets/TouchControls.cs <<'CSEOF'
+          using System.Collections;
+          using System.Collections.Generic;
+          using UnityEngine;
+
+          // Camada de toque: joystick (esquerda), botoes (direita) e olhar arrastando a tela.
+          [DefaultExecutionOrder(-10000)]
+          public class TouchControls : MonoBehaviour
+          {
+              public static Vector2 Move;
+              public static Vector2 Look;
+
+              static TouchControls instance;
+              const bool ShowDebug = false;
+              static string lastKey = "-";
+              static bool shiftOn; // Shift vira liga/desliga: 1 toque corre, outro toque anda
+              static int errCount;
+              static int updatedFrame;
+              static readonly Dictionary<KeyCode, int> pressSeen = new Dictionary<KeyCode, int>();
+              static readonly Dictionary<KeyCode, int> releaseSeen = new Dictionary<KeyCode, int>();
+              static string lastError = "";
+              GUIStyle dbgStyle;
+              static readonly Dictionary<KeyCode, bool> down = new Dictionary<KeyCode, bool>();
+              static readonly Dictionary<KeyCode, int> pressedFrame = new Dictionary<KeyCode, int>();
+              static readonly Dictionary<KeyCode, int> releasedFrame = new Dictionary<KeyCode, int>();
+              static readonly List<KeyCode> pulseKeys = new List<KeyCode>();
+              static readonly List<int> pulseUntil = new List<int>();
+              TouchScreenKeyboard kb;
+              string kbPrev = "";
+
+              class Btn
+              {
+                  public string label;
+                  public KeyCode key;
+                  public Rect r;
+                  public int finger = -1;
+                  public bool wasHeld;
+                  public bool isKeyboard;
+              }
+
+              readonly List<Btn> btns = new List<Btn>();
+              Texture2D circle;
+              GUIStyle style;
+              Vector2 joyCenter;
+              float joyRadius;
+              float unit;
+              int joyFinger = -1;
+              int lookFinger = -1;
+              const float LookScale = 0.12f;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+              static void Boot()
+              {
+                  if (Application.platform != RuntimePlatform.Android || instance != null) return;
+                  GameObject go = new GameObject("TouchControls");
+                  DontDestroyOnLoad(go);
+                  instance = go.AddComponent<TouchControls>();
+              }
+
+              public static bool IsDown(KeyCode k) { bool v; return down.TryGetValue(k, out v) && v; }
+              // GetKeyDown/Up virtual. O codigo normal (Update) enxerga o toque no proprio quadro.
+              // Ja a fisica (OnTriggerStay, FixedUpdate...) roda ANTES do Update do quadro, entao recebe
+              // o toque uma unica vez, no primeiro passo de fisica depois dele.
+              static bool Edge(Dictionary<KeyCode, int> frames, Dictionary<KeyCode, int> seenMap, KeyCode k)
+              {
+                  int f;
+                  if (!frames.TryGetValue(k, out f)) return false;
+                  int fc = Time.frameCount;
+                  if (updatedFrame == fc) return f == fc;
+                  if (f >= fc) return false;
+                  int seen;
+                  if (seenMap.TryGetValue(k, out seen) && seen >= f) return seen == fc;
+                  if (fc - f > 10) return false;
+                  seenMap[k] = fc;
+                  return true;
+              }
+
+              public static bool WasPressed(KeyCode k) { return Edge(pressedFrame, pressSeen, k); }
+              public static bool WasReleased(KeyCode k) { return Edge(releasedFrame, releaseSeen, k); }
+
+              static void SetKey(KeyCode k, bool on)
+              {
+                  bool cur;
+                  down.TryGetValue(k, out cur);
+                  if (on == cur) return;
+                  down[k] = on;
+                  if (on) { pressedFrame[k] = Time.frameCount; lastKey = k.ToString(); }
+                  else releasedFrame[k] = Time.frameCount;
+              }
+
+              static void SetKeyP(KeyCode k, bool on) { SetKey(k, on || pulseKeys.Contains(k)); }
+
+              // Tecla digitada no teclado do Android vira um aperto curto da tecla correspondente
+              static void Pulse(KeyCode k)
+              {
+                  if (k == KeyCode.None || pulseKeys.Contains(k)) return;
+                  pulseKeys.Add(k);
+                  pulseUntil.Add(Time.frameCount + 4);
+                  SetKey(k, true);
+              }
+
+              static KeyCode CharKey(char c)
+              {
+                  c = char.ToUpperInvariant(c);
+                  if (c >= 'A' && c <= 'Z') return (KeyCode)((int)KeyCode.A + (c - 'A'));
+                  if (c >= '0' && c <= '9') return (KeyCode)((int)KeyCode.Alpha0 + (c - '0'));
+                  if (c == ' ') return KeyCode.Space;
+                  if (c == '\n') return KeyCode.Return;
+                  return KeyCode.None;
+              }
+
+              void ToggleKeyboard()
+              {
+                  if (kb != null)
+                  {
+                      kb.active = false;
+                      kb = null;
+                      return;
+                  }
+                  TouchScreenKeyboard.hideInput = true;
+                  kb = TouchScreenKeyboard.Open("", TouchScreenKeyboardType.Default, false, false, false, false);
+                  kbPrev = "";
+              }
+
+              void PumpKeyboard()
+              {
+                  for (int i = pulseKeys.Count - 1; i >= 0; i--)
+                  {
+                      if (Time.frameCount >= pulseUntil[i])
+                      {
+                          SetKey(pulseKeys[i], false);
+                          pulseKeys.RemoveAt(i);
+                          pulseUntil.RemoveAt(i);
+                      }
+                  }
+                  if (kb == null) return;
+                  TouchScreenKeyboard.Status st = kb.status;
+                  if (st == TouchScreenKeyboard.Status.Done)
+                  {
+                      Pulse(KeyCode.Return);
+                      kb = null;
+                      return;
+                  }
+                  if (st != TouchScreenKeyboard.Status.Visible)
+                  {
+                      kb = null;
+                      return;
+                  }
+                  string t = kb.text ?? "";
+                  if (t.Length > kbPrev.Length)
+                  {
+                      for (int i = kbPrev.Length; i < t.Length; i++) Pulse(CharKey(t[i]));
+                  }
+                  else if (t.Length < kbPrev.Length)
+                  {
+                      for (int i = t.Length; i < kbPrev.Length; i++) Pulse(KeyCode.Backspace);
+                  }
+                  kbPrev = t;
+                  if (t.Length > 200) { kb.text = ""; kbPrev = ""; }
+              }
+
+              static void OnLog(string cond, string stack, LogType type)
+              {
+                  if (type != LogType.Exception && type != LogType.Error) return;
+                  errCount++;
+                  lastError = cond.Length > 140 ? cond.Substring(0, 140) : cond;
+              }
+
+              void AddBtn(string label, KeyCode key)
+              {
+                  Btn b = new Btn();
+                  b.label = label;
+                  b.key = key;
+                  btns.Add(b);
+              }
+
+              void Awake()
+              {
+                  circle = MakeCircle(128);
+                  Application.logMessageReceived += OnLog;
+                  // Linha de cima (canto superior direito): ENTER TAB 1 2 3 ESC
+                  AddBtn("ENTER", KeyCode.Return);
+                  AddBtn("TAB", KeyCode.Tab);
+                  AddBtn("1", KeyCode.Alpha1);
+                  AddBtn("2", KeyCode.Alpha2);
+                  AddBtn("3", KeyCode.Alpha3);
+                  AddBtn("ESC", KeyCode.Escape);
+                  // Grade de baixo (canto inferior direito), linha de cima: Q E R F
+                  AddBtn("Q", KeyCode.Q);
+                  AddBtn("E", KeyCode.E);
+                  AddBtn("R", KeyCode.R);
+                  AddBtn("F", KeyCode.F);
+                  // linha de baixo: C H CTRL KEYBOARD
+                  AddBtn("C", KeyCode.C);
+                  AddBtn("H", KeyCode.H);
+                  AddBtn("CTRL", KeyCode.LeftControl);
+                  AddBtn("KEYBOARD", KeyCode.None);    // abre/fecha o teclado do Android
+                  btns[btns.Count - 1].isKeyboard = true;
+                  Layout();
+              }
+
+              void Layout()
+              {
+                  float w = Screen.width;
+                  float h = Screen.height;
+                  unit = Mathf.Min(w, h) * 0.15f;
+                  float g = unit * 0.1f;
+                  float m = unit * 0.3f;
+                  joyRadius = unit * 1.1f;
+                  joyCenter = new Vector2(m + joyRadius * 1.1f, m + joyRadius * 1.1f);
+                  // 6 botoes pequenos no canto superior direito
+                  float s = unit * 0.8f;
+                  for (int i = 0; i < 6; i++)
+                  {
+                      float x = w - m - s - (5 - i) * (s + g);
+                      float y = h - m - s;
+                      btns[i].r = new Rect(x, y, s, s);
+                  }
+                  // grade 4 colunas x 2 linhas no canto inferior direito
+                  for (int i = 6; i < btns.Count; i++)
+                  {
+                      int k = i - 6;
+                      int row = k / 4;
+                      int col = k % 4;
+                      float x = w - m - unit - (3 - col) * (unit + g);
+                      float y = m + (1 - row) * (unit + g);
+                      btns[i].r = new Rect(x, y, unit, unit);
+                  }
+              }
+
+              void Begin(Touch t)
+              {
+                  Vector2 p = t.position;
+                  if (joyFinger < 0 && (p - joyCenter).magnitude < joyRadius * 1.7f)
+                  {
+                      joyFinger = t.fingerId;
+                      return;
+                  }
+                  float pad = unit * 0.1f;
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Rect b = btns[i].r;
+                      Rect r = new Rect(b.x - pad, b.y - pad, b.width + pad * 2f, b.height + pad * 2f);
+                      if (btns[i].finger < 0 && r.Contains(p))
+                      {
+                          btns[i].finger = t.fingerId;
+                          return;
+                      }
+                  }
+                  if (lookFinger < 0 && p.x > Screen.width * 0.3f) lookFinger = t.fingerId;
+              }
+
+              void End(int id)
+              {
+                  if (joyFinger == id) joyFinger = -1;
+                  if (lookFinger == id) lookFinger = -1;
+                  for (int i = 0; i < btns.Count; i++)
+                      if (btns[i].finger == id) btns[i].finger = -1;
+              }
+
+              void Hold(Touch t)
+              {
+                  if (t.fingerId == joyFinger)
+                  {
+                      Vector2 v = (t.position - joyCenter) / joyRadius;
+                      if (v.magnitude > 1f) v = v.normalized;
+                      if (v.magnitude < 0.15f) v = Vector2.zero;
+                      Move = v;
+                  }
+                  else if (t.fingerId == lookFinger)
+                  {
+                      Look += t.deltaPosition * LookScale;
+                  }
+              }
+
+              void Update()
+              {
+                  Layout();
+                  Look = Vector2.zero;
+                  Touch[] touches = Input.touches;
+                  if (touches.Length == 0)
+                  {
+                      joyFinger = -1;
+                      lookFinger = -1;
+                      for (int i = 0; i < btns.Count; i++) btns[i].finger = -1;
+                  }
+                  for (int i = 0; i < touches.Length; i++)
+                  {
+                      Touch t = touches[i];
+                      if (t.phase == TouchPhase.Began) Begin(t);
+                      if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) End(t.fingerId);
+                      else Hold(t);
+                  }
+                  if (joyFinger < 0) Move = Vector2.zero;
+                  PumpKeyboard();
+                  SetKeyP(KeyCode.W, Move.y > 0.5f);
+                  SetKeyP(KeyCode.S, Move.y < -0.5f);
+                  SetKeyP(KeyCode.A, Move.x < -0.5f);
+                  SetKeyP(KeyCode.D, Move.x > 0.5f);
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Btn b = btns[i];
+                      bool held = b.finger >= 0;
+                      if (b.isKeyboard)
+                      {
+                          if (held && !b.wasHeld) ToggleKeyboard();
+                          b.wasHeld = held;
+                          continue;
+                      }
+                      if (b.key == KeyCode.LeftShift)
+                      {
+                          if (held && !b.wasHeld) shiftOn = !shiftOn;
+                          SetKey(b.key, shiftOn);
+                      }
+                      else SetKeyP(b.key, held);
+                      b.wasHeld = held;
+                  }
+                  updatedFrame = Time.frameCount;
+              }
+
+              void OnGUI()
+              {
+                  if (style == null)
+                  {
+                      style = new GUIStyle(GUI.skin.label);
+                      style.alignment = TextAnchor.MiddleCenter;
+                      style.normal.textColor = Color.white;
+                  }
+                  if (Event.current.type != EventType.Repaint) return;
+                  float h = Screen.height;
+                  style.fontSize = Mathf.RoundToInt(unit * 0.27f);
+                  GUI.color = new Color(1f, 1f, 1f, 0.45f);
+                  GUI.DrawTexture(new Rect(joyCenter.x - joyRadius, h - joyCenter.y - joyRadius, joyRadius * 2f, joyRadius * 2f), circle);
+                  Vector2 k = joyCenter + Move * joyRadius * 0.6f;
+                  float kr = joyRadius * 0.42f;
+                  GUI.color = new Color(1f, 1f, 1f, 0.8f);
+                  GUI.DrawTexture(new Rect(k.x - kr, h - k.y - kr, kr * 2f, kr * 2f), circle);
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Btn b = btns[i];
+                      Rect gr = new Rect(b.r.x, h - b.r.yMax, b.r.width, b.r.height);
+                      GUI.color = new Color(1f, 1f, 1f, (b.finger >= 0 || (b.key == KeyCode.LeftShift && shiftOn) || (b.isKeyboard && kb != null)) ? 0.95f : 0.5f);
+                      GUI.DrawTexture(gr, circle);
+                      GUI.color = Color.white;
+                      int len = b.label.Length;
+                      style.fontSize = Mathf.RoundToInt(unit * (len <= 2 ? 0.27f : (len <= 5 ? 0.17f : 0.13f)));
+                      GUI.Label(gr, b.label, style);
+                  }
+                  GUI.color = Color.white;
+                  if (ShowDebug)
+                  {
+                      if (dbgStyle == null)
+                      {
+                          dbgStyle = new GUIStyle(GUI.skin.label);
+                          dbgStyle.alignment = TextAnchor.UpperLeft;
+                          dbgStyle.wordWrap = true;
+                          dbgStyle.normal.textColor = Color.yellow;
+                      }
+                      dbgStyle.fontSize = Mathf.RoundToInt(unit * 0.2f);
+                      GUI.Label(new Rect(Screen.width * 0.18f, 4f, Screen.width * 0.64f, unit * 1.2f), "tecla: " + lastKey + " | erros: " + errCount + "\n" + lastError, dbgStyle);
+                  }
+              }
+
+              static Texture2D MakeCircle(int s)
+              {
+                  Texture2D t = new Texture2D(s, s, TextureFormat.RGBA32, false);
+                  float c = (s - 1) * 0.5f;
+                  float r = s * 0.5f;
+                  Color[] px = new Color[s * s];
+                  for (int y = 0; y < s; y++)
+                  {
+                      for (int x = 0; x < s; x++)
+                      {
+                          float d = Mathf.Sqrt((x - c) * (x - c) + (y - c) * (y - c)) / r;
+                          float edge = Mathf.Clamp01((1f - d) * r);
+                          float a = (d > 0.93f ? 1f : 0.35f) * edge;
+                          px[y * s + x] = new Color(1f, 1f, 1f, a);
+                      }
+                  }
+                  t.SetPixels(px);
+                  t.Apply();
+                  t.filterMode = FilterMode.Bilinear;
+                  return t;
+              }
+          }
+
+          // Substitui Input.GetKey*/GetAxis* pelas versoes que tambem aceitam o toque.
+          public static class TInput
+          {
+              public static bool GetKey(KeyCode k) { return Input.GetKey(k) || TouchControls.IsDown(k); }
+              public static bool GetKeyDown(KeyCode k) { return Input.GetKeyDown(k) || TouchControls.WasPressed(k); }
+              public static bool GetKeyUp(KeyCode k) { return Input.GetKeyUp(k) || TouchControls.WasReleased(k); }
+              public static bool GetKey(string n) { try { return Input.GetKey(n); } catch (System.Exception) { return false; } }
+              public static bool GetKeyDown(string n) { try { return Input.GetKeyDown(n); } catch (System.Exception) { return false; } }
+              public static bool GetKeyUp(string n) { try { return Input.GetKeyUp(n); } catch (System.Exception) { return false; } }
+              public static float GetAxis(string n) { return Axis(n, false); }
+              public static float GetAxisRaw(string n) { return Axis(n, true); }
+
+              // Usado nos scripts de camera: olhar pelo toque, sem joystick/teclas virtuais.
+              public static float CamAxis(string n)
+              {
+                  if (n == "Mouse X" || n == "Mouse Y") return Axis(n, false);
+                  try { return Input.GetAxis(n); } catch (System.Exception) { return 0f; }
+              }
+
+              static float Axis(string n, bool raw)
+              {
+                  float v;
+                  try { v = raw ? Input.GetAxisRaw(n) : Input.GetAxis(n); }
+                  catch (System.Exception) { return 0f; }
+                  if (n == "Horizontal") return Mathf.Clamp(v + TouchControls.Move.x, -1f, 1f);
+                  if (n == "Vertical") return Mathf.Clamp(v + TouchControls.Move.y, -1f, 1f);
+                  // No Android o Unity transforma QUALQUER dedo em "mouse" (inclusive o do joystick).
+                  // Por isso o mouse e ignorado aqui: a camera so olha pelo dedo de olhar.
+                  if (n == "Mouse X") return Application.platform == RuntimePlatform.Android ? TouchControls.Look.x : v;
+                  if (n == "Mouse Y") return Application.platform == RuntimePlatform.Android ? TouchControls.Look.y : v;
+                  return v;
+              }
+          }
+
+          // Ajustes de desempenho e correcoes para celulares de entrada (ex.: Moto G24).
+          // Mexa nos valores abaixo pra equilibrar qualidade x desempenho.
+          public static class MobileTune
+          {
+              const int Fps = 30;              // limite de quadros por segundo (30 = bem mais leve e fresco; se quiser mais fluido, use 60)
+              const float RenderScale = 0.6f;  // 1 = resolucao nativa; menor = mais leve
+              const int TextureLimit = 1;      // 0 = texturas cheias, 1 = metade (usa menos memoria)
+              // sombras: sempre desligadas (sao as mais pesadas)
+
+              static bool resized;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              static void Boot()
+              {
+                  if (Application.platform != RuntimePlatform.Android) return;
+                  UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnLoaded;
+                  Apply();
+              }
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+              static void BootFixer()
+              {
+                  if (Application.platform != RuntimePlatform.Android) return;
+                  GameObject go = new GameObject("MobileFixer");
+                  Object.DontDestroyOnLoad(go);
+                  go.AddComponent<MobileFixer>();
+              }
+
+              static void OnLoaded(UnityEngine.SceneManagement.Scene s, UnityEngine.SceneManagement.LoadSceneMode m)
+              {
+                  Apply();
+                  MobileFixer.RequestFull();
+              }
+
+              public static void Apply()
+              {
+                  // Qualidade sempre no nivel mais baixo (Low), mesmo se o jogo tentar mudar
+                  if (QualitySettings.GetQualityLevel() != 0) QualitySettings.SetQualityLevel(0, true);
+                  Screen.sleepTimeout = SleepTimeout.NeverSleep;
+                  QualitySettings.vSyncCount = 0;
+                  QualitySettings.antiAliasing = 0;
+                  QualitySettings.anisotropicFiltering = AnisotropicFiltering.Disable;
+                  QualitySettings.pixelLightCount = 1;
+                  QualitySettings.softParticles = false;
+                  QualitySettings.realtimeReflectionProbes = false;
+                  QualitySettings.skinWeights = SkinWeights.TwoBones;
+                  QualitySettings.lodBias = 0.6f;
+                  QualitySettings.shadowDistance = 0f;
+                  QualitySettings.shadowCascades = 0;
+                  QualitySettings.billboardsFaceCameraPosition = false;
+                  QualitySettings.particleRaycastBudget = 16;
+                  QualitySettings.asyncUploadTimeSlice = 4;
+                  QualitySettings.asyncUploadBufferSize = 16;
+                  QualitySettings.shadows = ShadowQuality.Disable;
+                  QualitySettings.masterTextureLimit = TextureLimit;
+                  Application.targetFrameRate = Fps;
+                  if (!resized && Screen.height > 540)
+                  {
+                      resized = true;
+                      int h = Mathf.RoundToInt(Screen.height * RenderScale);
+                      int w = Mathf.RoundToInt(Screen.width * RenderScale);
+                      Screen.SetResolution(w, h, true);
+                  }
+              }
+          }
+
+          // Corrige dois problemas do port:
+          // 1) O shader das particulas usa GPU instancing (SSBO no vertex shader), que o Mali nao suporta
+          //    (erro "vertex shader storage blocks (1) is greater than the maximum (0)"). Desligamos.
+          // 2) Todos os shaders do jogo sao trocados por um toon simples e leve (contorno fino so nos personagens).
+          public class MobileFixer : MonoBehaviour
+          {
+                        // Efeitos de camera (SSAO, Bloom, MotionBlur, AntiAliasing): pesados no celular e podem
+              // deixar a cena Dream toda branca. false = desligados.
+              const bool KeepImageEffects = false;
+              static bool full = true;
+              static float whiteSince = -1f;
+
+              public static void RequestFull() { full = true; }
+
+              IEnumerator Start()
+              {
+                  WaitForSeconds w = new WaitForSeconds(1.5f);
+                  int n = 0;
+                  while (true)
+                  {
+                      yield return w;
+                      n++;
+                      if (full) { full = false; FixMaterials(); }
+                      if (n % 3 == 0) { MobileTune.Apply(); FixParticles(); FixCameras(); FixLights(); }
+                      WatchDream();
+                  }
+              }
+
+              static void FixParticles()
+              {
+                  try
+                  {
+                      ParticleSystemRenderer[] ps = Resources.FindObjectsOfTypeAll<ParticleSystemRenderer>();
+                      for (int i = 0; i < ps.Length; i++)
+                          if (ps[i] != null && ps[i].enableGPUInstancing) ps[i].enableGPUInstancing = false;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              // Desliga sombras de todas as luzes
+              static void FixLights()
+              {
+                  try
+                  {
+                      Light[] ls = FindObjectsOfType<Light>();
+                      for (int i = 0; i < ls.Length; i++)
+                          if (ls[i] != null && ls[i].shadows != LightShadows.None) ls[i].shadows = LightShadows.None;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              static void FixCameras()
+              {
+                  if (KeepImageEffects) return;
+                  try
+                  {
+                      Camera[] cams = Camera.allCameras;
+                      for (int i = 0; i < cams.Length; i++)
+                      {
+                          MonoBehaviour[] mbs = cams[i].GetComponents<MonoBehaviour>();
+                          for (int j = 0; j < mbs.Length; j++)
+                          {
+                              if (mbs[j] == null || !mbs[j].enabled) continue;
+                              string t = mbs[j].GetType().Name;
+                              if (t.Contains("Bloom") || t.Contains("Blur") || t.Contains("SSAO") || t.Contains("AmbientOcc")
+                                  || t.Contains("ScreenSpace") || t.Contains("Antialiasing") || t.Contains("AntiAliasing")
+                                  || t.Contains("DepthOfField") || t.Contains("Vignette") || t.Contains("SunShafts")
+                                  || t.Contains("GlobalFog") || t.Contains("Tonemapping") || t.Contains("ColorCorrection")
+                                  || t.Contains("PostProcess") || t.Contains("NoiseAndGrain") || t.Contains("EdgeDetection"))
+                                  mbs[j].enabled = false;
+                          }
+                      }
+                  }
+                  catch (System.Exception) { }
+              }
+
+              // Se a tela da cena Dream ficar toda branca por mais de 8 segundos (imagem "White" do Fade
+              // que nao some), esconde essa imagem para o jogo continuar.
+              static void WatchDream()
+              {
+                  try
+                  {
+                      UnityEngine.SceneManagement.Scene sc = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+                      if (!sc.name.Contains("Dream")) { whiteSince = -1f; return; }
+                      UnityEngine.UI.Image[] imgs = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Image>();
+                      bool white = false;
+                      for (int i = 0; i < imgs.Length; i++)
+                      {
+                          UnityEngine.UI.Image im = imgs[i];
+                          if (im == null || im.name != "White" || !im.gameObject.activeInHierarchy) continue;
+                          if (im.color.a * im.canvasRenderer.GetAlpha() < 0.95f) continue;
+                          white = true;
+                          if (whiteSince < 0f) whiteSince = Time.unscaledTime;
+                          else if (Time.unscaledTime - whiteSince > 8f)
+                          {
+                              Color c = im.color;
+                              c.a = 0f;
+                              im.color = c;
+                              im.canvasRenderer.SetAlpha(0f);
+                              whiteSince = -1f;
+                          }
+                      }
+                      if (!white) whiteSince = -1f;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              static Shader toonShader;
+              static Shader invisibleShader;
+              const float OutlineWidth = 0.002f;        // espessura do contorno fino (0 = sem contorno)
+              const bool OutlineSoPersonagens = true;   // true = contorno so em personagens (bem mais leve)
+
+              // Shaders que NAO sao trocados (interface, texto, ceu, particulas)
+              static bool Keep(string n)
+              {
+                  if (n.StartsWith("UI/") || n.StartsWith("Sprites/") || n.StartsWith("GUI/") || n.StartsWith("TextMeshPro")) return true;
+                  if (n.StartsWith("Skybox") || n.StartsWith("Particles/") || n.StartsWith("Mobile/Particles") || n.StartsWith("Legacy Shaders/Particles")) return true;
+                  if (n.StartsWith("Custom/")) return true;
+                  if (n.StartsWith("Hidden/") && n != "Hidden/InternalErrorShader") return true;
+                  return false;
+              }
+
+              // Troca todos os shaders do jogo por um toon simples e barato (com contorno fino).
+              // Materiais "so contorno" ficam invisiveis; folhas viram toon com recorte, dos dois lados.
+              static void FixMaterials()
+              {
+                  try
+                  {
+                      if (toonShader == null) toonShader = Shader.Find("Custom/NoOutlineToon");
+                      if (invisibleShader == null) invisibleShader = Shader.Find("Custom/Invisible");
+                      if (toonShader == null) return;
+
+                      HashSet<Material> chars = new HashSet<Material>();
+                      SkinnedMeshRenderer[] sk = Resources.FindObjectsOfTypeAll<SkinnedMeshRenderer>();
+                      for (int i = 0; i < sk.Length; i++)
+                      {
+                          if (sk[i] == null) continue;
+                          Material[] sm = sk[i].sharedMaterials;
+                          for (int j = 0; j < sm.Length; j++) if (sm[j] != null) chars.Add(sm[j]);
+                      }
+
+                      Material[] ms = Resources.FindObjectsOfTypeAll<Material>();
+                      for (int i = 0; i < ms.Length; i++)
+                      {
+                          Material m = ms[i];
+                          if (m == null || m.shader == null) continue;
+                          if (m.shader == toonShader || m.shader == invisibleShader) continue;
+                          string n = m.shader.name;
+                          if (Keep(n)) continue;
+                          string mn = m.name.ToLowerInvariant();
+                          bool outline = n.IndexOf("outline", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                          bool leaf = mn.Contains("leaves") || mn.Contains("leaf");
+                          if (m.HasProperty("_Outline")) m.SetFloat("_Outline", 0f);
+                          if (outline && n.IndexOf("only", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                          {
+                              if (invisibleShader != null) m.shader = invisibleShader;
+                              continue;
+                          }
+                          Texture tex = m.HasProperty("_MainTex") ? m.GetTexture("_MainTex") : null;
+                          Color col = m.HasProperty("_Color") ? m.GetColor("_Color") : Color.white;
+                          Vector2 sc = m.HasProperty("_MainTex") ? m.GetTextureScale("_MainTex") : Vector2.one;
+                          Vector2 of = m.HasProperty("_MainTex") ? m.GetTextureOffset("_MainTex") : Vector2.zero;
+                          float cut = m.HasProperty("_Cutoff") ? m.GetFloat("_Cutoff") : 0f;
+                          if (leaf && cut < 0.5f) cut = 0.5f;
+                          int q = m.renderQueue;
+                          m.shader = toonShader;
+                          m.SetTexture("_MainTex", tex);
+                          m.SetTextureScale("_MainTex", sc);
+                          m.SetTextureOffset("_MainTex", of);
+                          m.SetColor("_Color", col);
+                          m.SetFloat("_Cutoff", cut);
+                          bool fade = q >= 3000;
+                          m.SetFloat("_SrcBlend", fade ? 5f : 1f);
+                          m.SetFloat("_DstBlend", fade ? 10f : 0f);
+                          m.SetFloat("_ZWrite", fade ? 0f : 1f);
+                          m.SetFloat("_Cull", leaf ? 0f : 2f);
+                          bool wantsOutline = !OutlineSoPersonagens || outline || chars.Contains(m);
+                          bool thin = !fade && !leaf && cut <= 0.01f && OutlineWidth > 0f && wantsOutline;
+                          m.SetFloat("_OutlineWidth", thin ? OutlineWidth : 0f);
+                          m.SetColor("_OutlineColor", Color.black);
+                          m.renderQueue = q;
+                      }
+                  }
+                  catch (System.Exception) { }
+              }
+          }
+          CSEOF
+
+      - name: Criar shaders toon (contorno fino)
+        run: |
+          mkdir -p project/Assets/Resources
+          cat > project/Assets/Resources/NoOutlineToon.shader <<'SHEOF1'
+          Shader "Custom/NoOutlineToon"
+          {
+              Properties
+              {
+                  _MainTex ("Texture", 2D) = "white" {}
+                  _Color ("Color", Color) = (1,1,1,1)
+                  _Cutoff ("Cutoff", Range(0,1)) = 0
+                  _SrcBlend ("Src", Float) = 1
+                  _DstBlend ("Dst", Float) = 0
+                  _ZWrite ("ZWrite", Float) = 1
+                  _Cull ("Cull", Float) = 2
+                  _OutlineWidth ("Outline Width", Float) = 0
+                  _OutlineColor ("Outline Color", Color) = (0,0,0,1)
+              }
+              SubShader
+              {
+                  Tags { "RenderType"="Opaque" }
+                  Pass
+                  {
+                      Tags { "LightMode"="ForwardBase" }
+                      Blend [_SrcBlend] [_DstBlend]
+                      ZWrite [_ZWrite]
+                      Cull [_Cull]
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #include "UnityCG.cginc"
+                      sampler2D _MainTex;
+                      float4 _MainTex_ST;
+                      fixed4 _Color;
+                      fixed _Cutoff;
+                      struct v2f
+                      {
+                          float4 pos : SV_POSITION;
+                          float2 uv : TEXCOORD0;
+                          fixed shade : TEXCOORD1;
+                      };
+                      v2f vert (appdata_base v)
+                      {
+                          v2f o;
+                          o.pos = UnityObjectToClipPos(v.vertex);
+                          o.uv = TRANSFORM_TEX(v.texcoord, _MainTex);
+                          float3 n = UnityObjectToWorldNormal(v.normal);
+                          float3 l = normalize(_WorldSpaceLightPos0.xyz + float3(0, 0.0001, 0));
+                          float nl = dot(n, l) * 0.5 + 0.5;
+                          o.shade = lerp(0.6, 1.0, smoothstep(0.3, 0.6, nl));
+                          return o;
+                      }
+                      fixed4 frag (v2f i) : SV_Target
+                      {
+                          fixed4 c = tex2D(_MainTex, i.uv) * _Color;
+                          clip(c.a - _Cutoff);
+                          c.rgb *= i.shade;
+                          return c;
+                      }
+                      ENDCG
+                  }
+                  Pass
+                  {
+                      Cull Front
+                      CGPROGRAM
+                      #pragma vertex vertO
+                      #pragma fragment fragO
+                      #include "UnityCG.cginc"
+                      float _OutlineWidth;
+                      fixed4 _OutlineColor;
+                      struct v2fo
+                      {
+                          float4 pos : SV_POSITION;
+                      };
+                      v2fo vertO (appdata_base v)
+                      {
+                          v2fo o;
+                          o.pos = UnityObjectToClipPos(v.vertex);
+                          if (_OutlineWidth <= 0.0)
+                          {
+                              o.pos = float4(2.0, 2.0, 2.0, 1.0);
+                              return o;
+                          }
+                          float3 norm = mul((float3x3)UNITY_MATRIX_IT_MV, v.normal);
+                          float2 dir = TransformViewToProjection(norm.xy);
+                          float dl = length(dir);
+                          dir = dl > 0.00001 ? dir / dl : float2(0.0, 0.0);
+                          dir.x *= _ScreenParams.y / _ScreenParams.x;
+                          o.pos.xy += dir * o.pos.w * _OutlineWidth;
+                          return o;
+                      }
+                      fixed4 fragO (v2fo i) : SV_Target
+                      {
+                          return _OutlineColor;
+                      }
+                      ENDCG
+                  }
+              }
+          }
+          SHEOF1
+          cat > project/Assets/Resources/Invisible.shader <<'SHEOF2'
+          Shader "Custom/Invisible"
+          {
+              SubShader
+              {
+                  Tags { "Queue"="Geometry" "RenderType"="Opaque" }
+                  Pass
+                  {
+                      ZWrite Off
+                      ColorMask 0
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #include "UnityCG.cginc"
+                      struct v2f { float4 pos : SV_POSITION; };
+                      v2f vert (float4 v : POSITION)
+                      {
+                          v2f o;
+                          o.pos = UnityObjectToClipPos(v);
+                          return o;
+                      }
+                      fixed4 frag (v2f i) : SV_Target { return fixed4(0, 0, 0, 0); }
+                      ENDCG
+                  }
+              }
+          }
+          SHEOF2
+
+      - name: Trocar leituras de teclado pelas que aceitam toque
+        run: |
+          cd project/Assets/Scripts
+          grep -rlZE --exclude-dir=Editor --include=*.cs 'Input\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(' . | xargs -0 -r perl -pi -e 's/(?<![\.\w])Input\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(/TInput.$1(/g'
+          echo "Chamadas trocadas: $(grep -rho --include=*.cs 'TInput\.Get' . | wc -l)"
+          echo "Chamadas originais restantes: $(grep -rhoE --include=*.cs '(^|[^.A-Za-z_])Input\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(' . | wc -l)"
+          echo "Scripts que usam mouse direto (posicao/clique): $(grep -rlE --include=*.cs 'Input\.(mousePosition|GetMouseButton)' . | wc -l)"
+
+      - name: Camera principal olha so pelo toque (ignora o joystick)
+        run: |
+          cd project/Assets/Scripts
+          find . -iname '*camera*.cs' ! -path '*/Editor/*' -print0 | while IFS= read -r -d '' f; do
+            perl -pi -e 's/TInput\.GetAxisRaw\(/TInput.CamAxis(/g; s/TInput\.GetAxis\(/TInput.CamAxis(/g' "$f"
+            echo "camera ajustada: $f"
+          done
+          echo "--- arquivos que leem eixos Horizontal/Vertical/Mouse:"
+          grep -rlE --include=*.cs 'TInput\.(GetAxis|GetAxisRaw|CamAxis)\("(Horizontal|Vertical|Mouse X|Mouse Y)"' . | head -30 || true
+
+      - name: Corrigir pasta de configuracao no Android
+        run: |
+          cd project/Assets/Scripts
+          grep -rlZE --exclude-dir=Editor --include=*.cs 'Environment\.GetFolderPath' . | xargs -0 -r perl -pi -e 's/Environment\.GetFolderPath\(Environment\.SpecialFolder\.(MyDocuments|Personal|ApplicationData|LocalApplicationData|DesktopDirectory)\)/Application.persistentDataPath/g'
+          echo "persistentDataPath em: $(grep -rl --include=*.cs 'Application.persistentDataPath' . | wc -l) arquivos"
+
+      - name: Instalar Unity Hub 3.22.6 (versao antiga, caminho /opt)
+        run: |
+          wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
+          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
+          printf 'Package: unityhub\nPin: version 3.22.6\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unityhub=3.22.6 ffmpeg xvfb
+          sudo sed -i 's/^\(.*DISPLAY=:.*XAUTHORITY=.*\)\( "\$@" \)2>&1$/\1\2/' /usr/bin/xvfb-run
+          if [ ! -x /opt/unityhub/unityhub ] && [ -x /usr/lib/unityhub/unityhub ]; then
+            sudo ln -s /usr/lib/unityhub /opt/unityhub
+          fi
+          printf '#!/bin/bash\nxvfb-run --auto-servernum /opt/unityhub/unityhub "$@" 2>/dev/null' | sudo tee /usr/bin/unity-hub >/dev/null
+          sudo chmod 777 /usr/bin/unity-hub
+          ls -la /opt/unityhub/unityhub
+
+      - name: Instalar a Unity do projeto (com modulo Android)
+        uses: RageAgainstThePixel/unity-setup@v1
+        with:
+          unity-version: ${{ env.UNITY_VERSION }}
+          build-targets: Android
+
+      - name: Restaurar o ProjectVersion original do projeto
+        run: cp "$RUNNER_TEMP/ProjectVersion.original" project/ProjectSettings/ProjectVersion.txt
+
+      - name: Ativar licenca Personal
+        uses: RageAgainstThePixel/activate-unity-license@v1
+        with:
+          license: personal
+          username: opsariel123@gmail.com
+          password: "Y_6anderes"
+
+      - name: Compilar o APK
+        uses: RageAgainstThePixel/unity-action@v1
+        with:
+          log-name: build-apk
+          args: -quit -batchmode -nographics -projectPath ${{ github.workspace }}/project -buildTarget Android -executeMethod CIBuild.Build
+
+      - name: Enviar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yamane-APK
+          path: build/*.apk
+          if-no-files-found: error
+
+      - name: Diagnostico do Unity Hub
+        if: always()
+        run: |
+          dpkg -l | grep -i unityhub || echo "pacote unityhub NAO instalado"
+          dpkg -L unityhub 2>/dev/null | head -40 || true
+          ls -la /opt || true
+          ls -la /opt/unityhub 2>/dev/null | head -30 || echo "sem /opt/unityhub"
+          apt-cache policy unityhub | head -10 || true
+
+      - name: Resumo dos erros do Unity
+        if: failure()
+        run: |
+          LOGS="$HOME/.config/unity3d/Editor.log $(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE" "$HOME" -name '*.log' -size +200k 2>/dev/null | head -5)"
+          for f in $LOGS; do
+            [ -f "$f" ] || continue
+            echo "=============== $f ($(wc -l < "$f") linhas)"
+            echo "--- erros de compilacao (error CS):"
+            grep -E "error CS[0-9]+" "$f" | sed 's/^.*Assets\//Assets\//' | awk '!seen[$0]++' | head -40
+            echo "--- total de linhas com error CS: $(grep -cE 'error CS[0-9]+' "$f")"
+            echo "--- outras falhas:"
+            grep -nE "Scripts have compiler errors|Build Failed|BuildFailedException|Aborting batchmode|Android SDK|NDK|Gradle|FAILURE|Exception:" "$f" | awk '!seen[$0]++' | head -30
+          done
